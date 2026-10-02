@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .env
 config.json
+snapshot_*.json
+change_log_*.json
+state_*.json
+*.json.tmp

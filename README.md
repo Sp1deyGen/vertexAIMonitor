@@ -1,116 +1,181 @@
+<div align="center">
+
 # VertexWatch
 
-VertexWatch watches the Vertex AI OCR configs across our five environments and tells us, by email, the moment one of them changes. If a change looks wrong, you reply to that email in plain English and VertexWatch replies with the exact edit to make. It never writes to an environment itself. A person always applies the change.
+**Change control for the prompts behind an OCR pipeline.**
 
-| Environment | Backend |
-|---|---|
-| `dev` | EKA API (dev) |
-| `sandbox` | EKA API (UAT sandbox) |
-| `jkc-uat` | JK Systems UAT |
-| `jkc-prod` | JK Systems Production |
-| `prod` | EKA Production (Heimdall) |
+Every config change is caught, explained, and fixable from a single email reply.
 
-## Why it exists
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-scheduled-2088FF?logo=githubactions&logoColor=white)
+![LLM](https://img.shields.io/badge/LLM-multi--model%20pool-F55036)
+![Email](https://img.shields.io/badge/interface-email-EA4335?logo=gmail&logoColor=white)
+![Auto-apply](https://img.shields.io/badge/auto--apply-never-2ea44f)
 
-Extraction quality depends on a few config fields: the system and user instructions, the model, and the generation settings. A small edit to any of them can change how every invoice is read, and before this there was no record of who changed what or when.
+<br/>
 
-Fixing a bad change was also slow. Someone had to open the admin panel, find the config and hand-edit a prompt that can run to thousands of characters. VertexWatch moves that loop into the alert email itself.
+| 5 | 15 min | 1 | 0 |
+|:---:|:---:|:---:|:---:|
+| environments watched | reply check interval | email per changed version | changes applied without a human |
 
-## What a change looks like
+</div>
+
+---
+
+## The problem
+
+An OCR pipeline is only as good as the prompt and model settings behind it. One edited sentence in a system instruction, or a temperature nudged from 0.2 to 0.9, quietly changes how every document is read. Nobody gets told, and by the time extraction quality drops, nobody remembers what changed.
+
+Rolling a bad change back used to mean opening an admin panel, finding the right config, and hand-editing a prompt thousands of characters long.
+
+## The approach
+
+VertexWatch treats config drift the way code review treats commits. Every change becomes a thread, and the thread is where it gets fixed.
 
 ```text
-[VertexWatch][PROD] Config #42 | INVOICE | v7 | MODIFIED
-    Summary: dates are now normalised to ISO; the GSTIN rule was removed.
-
-Reviewer:     Put the GSTIN rule back and set temperature to 0.2.
-VertexWatch:  Draft v1, current vs proposed, plus JSON to paste.
-
-Reviewer:     Keep the temperature as it is.
-VertexWatch:  Draft v2. Changes from v1: temperature dropped.
-
-(the reviewer applies it in the admin panel)
-
-VertexWatch:  Applied: full match.
+ [VertexWatch][PROD] Config #42 | INVOICE | v7 | MODIFIED
+ ┃ AI summary: dates are now normalised to ISO; the GSTIN rule was removed.
+ ┃ before / after, highlighted at phrase level
+ ┃
+ ┣━ Reviewer     Put the GSTIN rule back and set temperature to 0.2.
+ ┣━ VertexWatch  Draft v1  ·  current vs proposed  ·  JSON ready to paste
+ ┣━ Reviewer     Keep the temperature as it is.
+ ┣━ VertexWatch  Draft v2  ·  changes from v1: temperature dropped
+ ┃
+ ┗━ VertexWatch  Applied: full match ✓
 ```
+
+No dashboard to log into and no new tool to learn. The inbox the team already watches becomes the control panel.
+
+---
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    A["Scheduled run<br/>every 15 min"] --> B{"Poll due?<br/>3h since last"}
-    B -- yes --> C["Fetch configs,<br/>diff vs snapshot"]
-    C --> D["One alert email<br/>per changed version"]
-    B -- every run --> E["Read replies<br/>over IMAP"]
-    E --> F["Draft the edit<br/>against the live config"]
-    F --> G["Reply in the<br/>same thread"]
-    G -. "applied by hand" .-> H["Next poll posts<br/>the match result"]
+    subgraph Watch["Watch"]
+        A["Scheduled run<br/>every 15 min"] --> B{"Poll due?"}
+        B -- "every 3h" --> C["Fetch every config<br/>diff vs snapshot"]
+    end
+    subgraph Tell["Tell"]
+        C --> D["One email per<br/>changed version"]
+    end
+    subgraph Fix["Fix"]
+        B -- "every run" --> E["Read replies"]
+        E --> F["Draft the edit<br/>from the live config"]
+        F --> G["Reply in thread"]
+    end
+    G -. "a person applies it" .-> H["Next poll confirms<br/>the match"]
 ```
 
-Each run is a GitHub Actions matrix job, one per environment, running in parallel.
+| Stage | What happens |
+|---|---|
+| **Detect** | Each config is reduced to the fields that shape extraction (instructions, model, generation settings) and diffed against the last snapshot. |
+| **Explain** | Prompt changes get a short plain-English summary and a phrase-level highlighted diff, not a raw wall of text. |
+| **Draft** | A reply in plain English becomes a validated, numbered draft with exact values and a paste-ready JSON block. |
+| **Refine** | Every further reply produces the next draft, showing exactly what moved since the last one. |
+| **Close the loop** | Once the change lands, the next poll reports a full match, a partial match, or a change that went another way. |
 
-1. **Detect.** Every config is reduced to the fields that matter and compared with the last saved snapshot.
-2. **Alert.** Each changed version gets its own email, and so its own thread. A change to `systemInstruction` comes with a short AI summary and a highlighted before and after.
-3. **Draft.** Replies from people on `ALERT_EMAIL` are read over IMAP. The reply and the live config go to a language model, which must answer with structured edits rather than prose. The edits are validated and sent back as a numbered draft.
-4. **Refine.** Each further reply produces the next draft, with a note of what moved since the last one.
-5. **Confirm.** When the config changes again, the next poll compares it with the open draft and reports a full match, a partial match, or a change that did not follow the draft.
+---
 
-## How the drafts are kept safe
+## Engineering decisions
 
-The model only proposes. Nothing it returns reaches a reviewer until the code has checked it.
+### The model proposes. The code decides.
+
+The language model never writes into a draft directly. It returns a small structured schema, and every proposed change is validated against the live config before a reviewer sees it.
 
 ```mermaid
 flowchart LR
-    R["Reviewer reply"] --> M["Model returns<br/>structured edits"]
-    M --> V{"Validation"}
-    V -- "unknown field,<br/>value out of range,<br/>text not found once" --> X["Explain the problem<br/>and ask again"]
-    V -- "revert" --> P["Exact value<br/>from the alert"]
+    R["Reviewer reply<br/>(treated as data)"] --> M["Model returns<br/>structured edits"]
+    M --> V{"Validator"}
+    V -- "unknown field" --> X["Explain and<br/>ask again"]
+    V -- "value out of range" --> X
+    V -- "quoted text not found once" --> X
+    V -- "revert" --> P["Exact value<br/>recorded in the alert"]
     V -- "valid" --> D["Draft"]
     P --> D
 ```
 
-- Only the monitored fields can be drafted, and numbers are range-checked (temperature 0 to 2, topP 0 to 1, and so on).
-- "Revert" restores the before-value recorded in the alert. The model is never asked to remember it.
-- Long instructions are only changed through find-and-replace edits whose text must appear exactly once in the live prompt. The model sees a trimmed copy of a long prompt, so a whole-text rewrite is refused rather than risking a truncated prompt.
-- Reply text is treated as data. Only addresses in `ALERT_EMAIL` are acted on, auto-replies are skipped, and quoted history and signatures are stripped before anything reaches the model.
-- Drafts for `prod` and `jkc-prod` carry an "apply only after review" banner, and every draft warns if the live config has moved since the alert.
-- Ambiguous requests get one clarifying question instead of a guess. A thread allows up to five drafts.
+- **Reverts are never guessed.** "Undo it" restores the before-value captured when the change was detected.
+- **Long prompts change surgically.** Edits must quote text that appears exactly once in the live prompt. A whole-prompt rewrite from a trimmed copy is refused, so a draft can never silently drop half a prompt.
+- **Reply text is data, not instructions.** Only the configured reviewers are acted on, auto-replies are skipped, and quoted history and signatures are stripped before anything reaches the model.
+- **Ambiguity gets a question, not a guess.** Unclear requests get one clarifying question back.
 
-## Edge cases it handles
+### Resilient to flaky AI
 
-- **A failed send is retried, not lost.** A config's snapshot only advances once its own alert has been sent, so one failed email doesn't hold back the others or get skipped.
-- **A network blip is not a deletion.** If one config fails to fetch, its last known version is kept for that poll instead of being reported as removed.
-- **Nothing is sent twice.** Snapshot and reply state are kept in GitHub Actions caches and saved even when a run fails. A reply is recorded as handled only after its answer has gone out.
-- **Model outages.** Each model on the Groq account has its own rate limit, so calls move to the next model on a rate limit or server error. A model too small for a request is skipped for that call, and a retired model is dropped for the run. If every model fails, alerts still go out with a local diff, and a reply is retried on later runs, then answered with a clear message after four attempts.
-- **Model output is checked, not trusted.** A highlighted diff is only used if its text matches the source exactly; otherwise the local diff is shown.
-- **Real email clients.** Gmail and Outlook quote formats, CRLF line endings and HTML-only replies are all handled when extracting what the reviewer wrote.
-- **Bulk changes.** A run that finds more than ten changed versions also sends a one-line-per-version digest.
-- **Removed configs.** A removal is alerted, but it opens no reply thread, since there is nothing left to draft against.
-
-## Setup
-
-1. Add these repository secrets under Settings, Secrets and variables, Actions:
-
-   | Secret | Purpose |
-   |---|---|
-   | `DEV_USERNAME`, `DEV_PASSWORD` | dev API login |
-   | `SANDBOX_USERNAME`, `SANDBOX_PASSWORD` | sandbox API login |
-   | `JKC_USERNAME`, `JKC_UAT_PASSWORD`, `JKC_PROD_PASSWORD` | JK Systems logins |
-   | `PROD_USERNAME`, `PROD_PASSWORD` | production API login |
-   | `GMAIL_USER`, `GMAIL_APP_PASS` | sending and reading inbox (Gmail App Password) |
-   | `ALERT_EMAIL` | comma-separated recipients, who are also the people allowed to request drafts |
-   | `GROQ_API_KEY` | optional; without it alerts still work, but there are no summaries or drafts |
-
-2. Turn on IMAP for the `GMAIL_USER` account (Gmail Settings, Forwarding and POP/IMAP) so replies can be read.
-3. The workflow then runs every 15 minutes on its own. To force a poll now, use Actions, VertexWatch, Run workflow.
-
-The first poll for each environment only saves a baseline. Alerts start from the next one.
-
-## Project layout
-
-```text
-monitor.py                  detection, alerts, reply drafting and the Groq model pool
-.github/workflows/main.yml  one matrix job per environment, every 15 minutes
-requirements.txt            requests; everything else is the Python standard library
+```mermaid
+flowchart LR
+    C["Request"] --> L["Least-used<br/>model"]
+    L -- "rate limited" --> N["Next model"] --> L
+    L -- "too large" --> S["Skip it,<br/>try a larger one"] --> L
+    L -- "retired" --> B["Drop for<br/>this run"] --> L
+    L -- "all failing" --> W["Back off,<br/>retry"] --> L
+    W -. "still failing" .-> F["Local fallback"]
 ```
 
-Tunable values, such as the poll interval, draft limit, value ranges and prompt sizes, are constants at the top of `monitor.py`.
+The model pool is discovered from the provider account on every run, so new models join and retired ones drop out with no code change. If every model is down, alerts still go out with a locally computed diff. AI improves the alert, but the alert never depends on it.
+
+---
+
+## Edge cases, handled
+
+<details open>
+<summary><b>Delivery and state</b></summary>
+
+| Situation | Behaviour |
+|---|---|
+| One alert fails to send | Only that config's snapshot is held back, so it is retried on the next poll and nothing else is blocked |
+| A single config fetch times out | Its last known version is kept, so a network blip is never reported as a deletion |
+| The run crashes midway | State is saved even on failure, so nothing is lost and nothing is sent twice |
+| A reply is handled | It is recorded only after the answer has actually gone out |
+| Dozens of versions change at once | Each still gets its own email, plus one digest listing them all |
+| A config is deleted | It is alerted, but no reply thread is opened, because there is nothing left to edit |
+
+</details>
+
+<details open>
+<summary><b>Email in the real world</b></summary>
+
+| Situation | Behaviour |
+|---|---|
+| Gmail and Outlook quoting styles | The reviewer's own words are extracted and quoted history is dropped |
+| HTML-only replies and Windows line endings | Normalised before parsing |
+| Out-of-office and auto-replies | Ignored |
+| Someone outside the reviewer list replies | Ignored |
+| A long back-and-forth | Every answer stays in the same thread, and drafts are capped per thread |
+
+</details>
+
+<details open>
+<summary><b>AI output</b></summary>
+
+| Situation | Behaviour |
+|---|---|
+| Model returns malformed JSON | Retried on another model, then the reviewer is asked to rephrase |
+| Model rewords text while highlighting it | Rejected, and an exact local diff is shown instead |
+| Model unavailable for a while | The reply is retried on later runs, and the thread is told plainly if it still cannot be processed |
+| Drafting against production | Every draft carries an "apply only after review" banner |
+
+</details>
+
+---
+
+## Under the hood
+
+```text
+monitor.py                  detection, alerting, reply drafting, model pool
+.github/workflows/main.yml  one parallel job per environment, on a schedule
+requirements.txt            a single dependency; the rest is the standard library
+```
+
+- Runs entirely on **GitHub Actions**, with no server to host. State lives in the Actions cache between runs.
+- **SMTP and IMAP** over one mailbox, threaded with standard `Message-ID` / `In-Reply-To` headers so mail clients keep each conversation together.
+- Credentials are read from repository secrets and never logged.
+- The tunable settings (poll interval, draft limit, value ranges, prompt budgets) sit as named constants at the top of `monitor.py`.
+
+<div align="center">
+<br/>
+
+**Catch the change. Understand it. Fix it from your inbox.**
+
+</div>

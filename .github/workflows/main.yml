@@ -1,232 +1,97 @@
 name: VertexWatch
- 
+
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */3 * * *"
- 
-# Prevent concurrent runs - only one environment at a time
+    - cron: "*/15 * * * *"   # reply check every run; full poll once 3 hours have passed since the last attempt
+
+# One workflow run at a time; the 5 environment jobs inside a run execute in parallel.
+# A queued run replaced by a newer one loses nothing: the next run polls if a poll is due.
 concurrency:
   group: vertexwatch-monitors
   cancel-in-progress: false
- 
+
 jobs:
- 
-  monitor-dev:
+  monitor:
+    name: monitor-${{ matrix.env }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { env: dev,      slug: dev,      user: DEV_USERNAME,     pass: DEV_PASSWORD }
+          - { env: sandbox,  slug: sandbox,  user: SANDBOX_USERNAME, pass: SANDBOX_PASSWORD }
+          - { env: jkc-uat,  slug: jkc_uat,  user: JKC_USERNAME,     pass: JKC_UAT_PASSWORD }
+          - { env: jkc-prod, slug: jkc_prod, user: JKC_USERNAME,     pass: JKC_PROD_PASSWORD }
+          - { env: prod,     slug: prod,     user: PROD_USERNAME,    pass: PROD_PASSWORD }
+    # Two caches: the path list is part of a cache's version, so the snapshot cache keeps its original
+    # two files (existing snapshots keep restoring) and the reply state has a cache of its own.
+    env:
+      RUN_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
+      SNAPSHOT_FILES: |
+        snapshot_${{ matrix.slug }}.json
+        change_log_${{ matrix.slug }}.json
+      STATE_FILE: state_${{ matrix.slug }}.json
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
- 
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
- 
+
       - name: Install dependencies
-        run: pip install requests
- 
-      - name: Restore cache
-        uses: actions/cache@v4
+        run: pip install -r requirements.txt
+
+      - name: Restore snapshot
+        id: snapshot
+        uses: actions/cache/restore@v4
         with:
-          path: |
-            snapshot_dev.json
-            change_log_dev.json
-          key: vertexwatch-dev-${{ github.run_id }}
-          restore-keys: |
-            vertexwatch-dev-
- 
-      - name: Run monitor (dev)
+          path: ${{ env.SNAPSHOT_FILES }}
+          key: vertexwatch-${{ matrix.env }}-${{ env.RUN_SUFFIX }}
+          restore-keys: vertexwatch-${{ matrix.env }}-
+
+      - name: Restore reply state
+        id: state
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.STATE_FILE }}
+          key: vertexwatch-state-${{ matrix.env }}-${{ env.RUN_SUFFIX }}
+          restore-keys: vertexwatch-state-${{ matrix.env }}-
+
+      - name: Run monitor (${{ matrix.env }})
+        id: monitor
         env:
-          ENV_TARGET:     dev
-          DEV_USERNAME:   ${{ secrets.DEV_USERNAME }}
-          DEV_PASSWORD:   ${{ secrets.DEV_PASSWORD }}
+          ENV_TARGET:     ${{ matrix.env }}
+          FORCE_POLL:     ${{ github.event_name == 'workflow_dispatch' }}
+          API_USERNAME:   ${{ secrets[matrix.user] }}
+          API_PASSWORD:   ${{ secrets[matrix.pass] }}
           GROQ_API_KEY:   ${{ secrets.GROQ_API_KEY }}
           GMAIL_USER:     ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           ALERT_EMAIL:    ${{ secrets.ALERT_EMAIL }}
         run: python monitor.py
- 
-      - name: Upload dev logs
-        if: always()
+
+      # Saved even when the run fails, so sent alerts and drafts are never re-sent
+      - name: Save snapshot
+        if: always() && steps.monitor.outputs.polled == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.SNAPSHOT_FILES }}
+          key: ${{ steps.snapshot.outputs.cache-primary-key }}
+
+      - name: Save reply state
+        if: always() && steps.monitor.outputs.state_changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.STATE_FILE }}
+          key: ${{ steps.state.outputs.cache-primary-key }}
+
+      - name: Upload change log
+        if: always() && steps.monitor.outputs.polled == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: logs-dev
-          path: change_log_dev.json
-          if-no-files-found: ignore
- 
-  monitor-sandbox:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
- 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
- 
-      - name: Install dependencies
-        run: pip install requests
- 
-      - name: Restore cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            snapshot_sandbox.json
-            change_log_sandbox.json
-          key: vertexwatch-sandbox-${{ github.run_id }}
-          restore-keys: |
-            vertexwatch-sandbox-
- 
-      - name: Run monitor (sandbox)
-        env:
-          ENV_TARGET:       sandbox
-          SANDBOX_USERNAME: ${{ secrets.SANDBOX_USERNAME }}
-          SANDBOX_PASSWORD: ${{ secrets.SANDBOX_PASSWORD }}
-          GROQ_API_KEY:     ${{ secrets.GROQ_API_KEY }}
-          GMAIL_USER:       ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASS:   ${{ secrets.GMAIL_APP_PASS }}
-          ALERT_EMAIL:      ${{ secrets.ALERT_EMAIL }}
-        run: python monitor.py
- 
-      - name: Upload sandbox logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-sandbox
-          path: change_log_sandbox.json
-          if-no-files-found: ignore
- 
-  monitor-jkc-uat:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
- 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
- 
-      - name: Install dependencies
-        run: pip install requests
- 
-      - name: Restore cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            snapshot_jkc_uat.json
-            change_log_jkc_uat.json
-          key: vertexwatch-jkc-uat-${{ github.run_id }}
-          restore-keys: |
-            vertexwatch-jkc-uat-
- 
-      - name: Run monitor (jkc-uat)
-        env:
-          ENV_TARGET:        jkc-uat
-          JKC_USERNAME:      ${{ secrets.JKC_USERNAME }}
-          JKC_UAT_PASSWORD:  ${{ secrets.JKC_UAT_PASSWORD }}
-          GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
-          GMAIL_USER:        ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASS:    ${{ secrets.GMAIL_APP_PASS }}
-          ALERT_EMAIL:       ${{ secrets.ALERT_EMAIL }}
-        run: python monitor.py
- 
-      - name: Upload jkc-uat logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-jkc-uat
-          path: change_log_jkc_uat.json
-          if-no-files-found: ignore
- 
-  monitor-jkc-prod:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
- 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
- 
-      - name: Install dependencies
-        run: pip install requests
- 
-      - name: Restore cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            snapshot_jkc_prod.json
-            change_log_jkc_prod.json
-          key: vertexwatch-jkc-prod-${{ github.run_id }}
-          restore-keys: |
-            vertexwatch-jkc-prod-
- 
-      - name: Run monitor (jkc-prod)
-        env:
-          ENV_TARGET:        jkc-prod
-          JKC_USERNAME:      ${{ secrets.JKC_USERNAME }}
-          JKC_PROD_PASSWORD: ${{ secrets.JKC_PROD_PASSWORD }}
-          GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
-          GMAIL_USER:        ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASS:    ${{ secrets.GMAIL_APP_PASS }}
-          ALERT_EMAIL:       ${{ secrets.ALERT_EMAIL }}
-        run: |
-          echo "=== DUMPING RUNNER ENV KEYS ==="
-          env | grep JKC || true
-          echo "==============================="
-          python monitor.py
- 
-      - name: Upload jkc-prod logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-jkc-prod
-          path: change_log_jkc_prod.json
-          if-no-files-found: ignore
- 
-  monitor-prod:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
- 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
- 
-      - name: Install dependencies
-        run: pip install requests
- 
-      - name: Restore cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            snapshot_prod.json
-            change_log_prod.json
-          key: vertexwatch-prod-${{ github.run_id }}
-          restore-keys: |
-            vertexwatch-prod-
- 
-      - name: Run monitor (prod)
-        env:
-          ENV_TARGET:     prod
-          PROD_USERNAME:  ${{ secrets.PROD_USERNAME }}
-          PROD_PASSWORD:  ${{ secrets.PROD_PASSWORD }}
-          GROQ_API_KEY:   ${{ secrets.GROQ_API_KEY }}
-          GMAIL_USER:     ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
-          ALERT_EMAIL:    ${{ secrets.ALERT_EMAIL }}
-        run: python monitor.py
- 
-      - name: Upload prod logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-prod
-          path: change_log_prod.json
+          name: logs-${{ matrix.env }}
+          path: change_log_${{ matrix.slug }}.json
           if-no-files-found: ignore

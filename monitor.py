@@ -446,6 +446,7 @@ class Provider(NamedTuple):
     api_key: str
     pool: tuple          # preferred models, best first
     id_prefix: str = ""  # listed models are only added when their id starts with this
+    account_rpm: bool = False  # rate limit covers the whole account, so a 429 means every model of it is limited
 
 
 APINEX_POOL = (
@@ -516,7 +517,9 @@ class LLMDispatcher:
         except (requests.RequestException, AttributeError, KeyError, TypeError, ValueError) as e:
             print(f"[LLM] {provider.name} model listing unavailable ({type(e).__name__}) — using its built-in pool")
             return list(provider.pool)
-        extra  = sorted((m for m in listed if m not in provider.pool),
+        # Other listed models join only when the listing says they are free to this account (apinex's
+        # /v1/models gives bare ids, so there only the preferred models are used)
+        extra  = sorted((m for m in listed if m not in provider.pool and ("allowFree" in listed[m] or not provider.id_prefix)),
                         key=lambda m: (-(listed[m].get("weight") or 0), m))
         models = [m for m in provider.pool if m in listed] + extra
         models = ([m for m in models if listed[m].get("health", "live") == "live"]
@@ -561,6 +564,8 @@ class LLMDispatcher:
         """Why the whole provider is unusable (bad key, or blocked before reaching the API), else None."""
         if resp.status_code == 401:
             return "rejected the API key"
+        if resp.status_code == 402:
+            return "refused for billing: " + resp.text[:200]
         if resp.status_code == 403 and not self._is_json(resp):
             return "blocked the request before it reached the API (an HTML page, not an API error)"
         return None
@@ -601,9 +606,10 @@ class LLMDispatcher:
 
             self._pace()
             retry_after_seen = 0.0
+            limited = set()  # account-wide rate-limited providers, skipped for the rest of this round
 
             for entry in entries:
-                if entry[0] in self.blocked:  # blocked earlier in this round
+                if entry[0] in self.blocked or entry[0] in limited:
                     continue
                 tag = f"{entry[0]}:{entry[1]}"
                 try:
@@ -640,6 +646,8 @@ class LLMDispatcher:
 
                 if status == 429 or status >= 500:
                     self.failures[entry] += 1
+                    if status == 429 and self.providers[entry[0]].account_rpm:
+                        limited.add(entry[0])
                     retry_after = resp.headers.get("Retry-After")
                     print(f"[LLM] ({label}) '{tag}' returned HTTP {status} "
                           f"— rotating to next model" + (f" (Retry-After: {retry_after}s)" if retry_after else ""))
@@ -701,8 +709,8 @@ class LLMDispatcher:
             if content:
                 answered += 1
                 print(f"[CHECK] {tag:<42} OK in {took}: {content.strip()[:40]!r}")
-            elif refused:
-                self.blocked.add(entry[0])
+            elif refused or (resp.status_code == 429 and self.providers[entry[0]].account_rpm):
+                self.blocked.add(entry[0])  # no point sending the rest of its models
                 print(f"[CHECK] {tag:<42} HTTP {resp.status_code} in {took}: {entry[0]} {refused}")
             else:
                 print(f"[CHECK] {tag:<42} HTTP {resp.status_code} in {took}: {resp.text[:200]!r}")
@@ -711,7 +719,7 @@ class LLMDispatcher:
 
 
 LLM_PROVIDERS = [p for p in (
-    Provider("apinex", "https://api.apinex.bond/v1", os.environ.get("APINEX_API_KEY", ""), APINEX_POOL, "free/"),
+    Provider("apinex", "https://api.apinex.bond/v1", os.environ.get("APINEX_API_KEY", ""), APINEX_POOL, "free/", True),
     Provider("groq", "https://api.groq.com/openai/v1", os.environ.get("GROQ_API_KEY", ""), GROQ_POOL),
 ) if p.api_key]
 NO_LLM_KEY = "No AI provider key is set (APINEX_API_KEY or GROQ_API_KEY)"

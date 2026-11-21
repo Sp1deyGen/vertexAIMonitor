@@ -105,15 +105,16 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    C["Request"] --> L["Least-used<br/>model"]
+    C["Request"] --> L["Best available<br/>model"]
     L -- "rate limited" --> N["Next model"] --> L
+    L -- "provider blocked" --> P["Fallback<br/>provider"] --> L
     L -- "too large" --> S["Skip it,<br/>try a larger one"] --> L
     L -- "retired" --> B["Drop for<br/>this run"] --> L
     L -- "all failing" --> W["Back off,<br/>retry"] --> L
     W -. "still failing" .-> F["Local fallback"]
 ```
 
-The model pool is discovered from the provider account on every run, so new models join and retired ones drop out with no code change. If every model is down, alerts still go out with a locally computed diff. AI improves the alert, but the alert never depends on it.
+Models are tried strongest first, and one that keeps failing drops behind the rest for the run. The pool is discovered from each provider account on every run, so new free models join and retired ones drop out with no code change, and a second provider takes over if the first is unreachable. If every model is down, alerts still go out with a locally computed diff. AI improves the alert, but the alert never depends on it.
 
 ---
 

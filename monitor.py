@@ -14,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from email.utils import make_msgid, parseaddr
 from html import escape, unescape
-from typing import Optional
+from typing import NamedTuple, Optional
 
 # ENVIRONMENT TARGET — set per workflow matrix job
 ENV_TARGET = os.environ.get("ENV_TARGET", "dev")
@@ -54,6 +54,7 @@ STATE_FILE    = f"state_{_state_suffix}.json"  # last poll time + reply threads
 # passed since the last poll attempt (10 min slack absorbs schedule jitter), or on a manual run.
 POLL_INTERVAL_SECONDS = 3 * 3600 - 600
 FORCE_POLL            = os.environ.get("FORCE_POLL", "false") == "true"
+LLM_CHECK             = os.environ.get("LLM_CHECK", "false") == "true"  # only test the AI models: no poll, no email
 
 CONFIG_RETRY_ATTEMPTS = 3
 CONFIG_RETRY_BACKOFF  = 2  # seconds, doubles each attempt
@@ -430,199 +431,306 @@ def append_log(entries: list):
     save_json(LOG_FILE, (entries + load_json(LOG_FILE, []))[:500])
 
 
-# GROQ MODEL POOL / DISPATCH
+# AI MODEL POOL / DISPATCH
 #
-# All email-summary text generation (formatting, functional summaries, semantic
-# diffing) is pure text — never image/OCR data — and used to hit a single
-# hardcoded model, which busts the Free-tier 8K TPM / 1K RPD bucket on that one
-# model whenever a poll finds several changed fields. GroqDispatcher spreads
-# calls across an ordered pool of interchangeable text models, each with its
-# own separate free-tier rate-limit bucket, and fails over to the next model
-# in the pool immediately on 429/5xx instead of hammering the one that just
-# got throttled.
-class GroqDispatcher:
-    MODEL_POOL = [
-        "llama-3.1-8b-instant",
-        "openai/gpt-oss-20b",
-        "qwen/qwen3-32b",
-        "openai/gpt-oss-120b",
-    ]
+# All AI work here (change summaries, phrase-level diffs, reply drafting) is
+# plain text, never image/OCR data. Every call goes to an ordered pool of models
+# on OpenAI-compatible providers: the best model first, and on any failure the
+# next one at once. A model that keeps failing sinks behind the healthy ones for
+# the rest of the run. apinex (free models, one daily token budget for the
+# account) is the primary provider; Groq, while its key is set, is a last-resort
+# fallback so the AI features survive apinex being down or unreachable.
+class Provider(NamedTuple):
+    name: str
+    base_url: str
+    api_key: str
+    pool: tuple          # preferred models, best first
+    id_prefix: str = ""  # listed models are only added when their id starts with this
 
-    MODELS_URL = "https://api.groq.com/openai/v1/models"
+
+APINEX_POOL = (
+    "free/gemini-4-hydrogen",
+    "free/qwen-3.8-max",
+    "free/kimi-k3",
+    "free/deepseek-v4-pro-0813",
+    "free/gpt-6-luna",
+    "free/glm-5.3-flashx",
+    "free/gemini-3.8-flash",
+    "free/deepseek-v4.1-flash",
+    "free/mimo-v2.6-pro",
+    "free/glm-5.3-flash",
+    "free/minimax-m3.1-flash",
+    "free/muse-spark-1.3",
+    "free/hy4",
+)
+GROQ_POOL = (
+    "openai/gpt-oss-120b",
+    "qwen/qwen3-32b",
+    "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant",
+)
+
+
+class LLMDispatcher:
     # Listed models that cannot do plain text chat completion (speech, safety classifiers, agent systems)
     NON_TEXT_MARKERS = ("whisper", "tts", "orpheus", "playai", "guard", "compound", "embed")
+    # apinex tags for routing helpers and aliases whose upstream model is unconfirmed
+    SKIP_TAGS = ("decision", "unverified")
 
     MIN_CALL_INTERVAL   = 0.5  # seconds between dispatch rounds — caps bursts to ~2 calls/sec
     POOL_RETRY_ATTEMPTS = 2    # extra backoff rounds once every model in the pool has failed once
+    CHECK_PROMPT        = [{"role": "user", "content": "Reply with the single word OK."}]
 
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.models = self._discover_models()
-        self.usage = {m: {"calls": 0, "tokens": 0} for m in self.models}
-        self.dead = set()  # models confirmed nonexistent/inaccessible this run — stop wasting calls on them
+    def __init__(self, providers: list):
+        self.providers = {p.name: p for p in providers}
+        self.entries   = [(p.name, m) for p in providers for m in self._discover_models(p)]
+        self.failures  = {e: 0 for e in self.entries}
+        self.dead      = set()  # (provider, model) pairs this account cannot use — skipped for the rest of the run
+        self.blocked   = set()  # providers that rejected the key or blocked the connection — skipped likewise
         self._last_round_ts = 0.0
 
-    def _discover_models(self) -> list:
-        """MODEL_POOL first (proven), then every other active text model the account lists.
-        Falls back to MODEL_POOL alone if the listing is unavailable."""
+    @classmethod
+    def _usable(cls, item: dict, provider: Provider) -> bool:
+        """A listed model joins the pool if it is active, free to this account, and does plain text chat."""
+        model = str(item.get("id", ""))
+        if not model.startswith(provider.id_prefix) or item.get("active", True) is False:
+            return False
+        if item.get("allowFree") is False:  # apinex: not open to free accounts
+            return False
+        if (item.get("dollarsPer1M") or 0) > 0 or (item.get("outputDollarsPer1M") or 0) > 0:  # apinex: paid model
+            return False
+        if any(marker in model.lower() for marker in cls.NON_TEXT_MARKERS):
+            return False
+        return not any(skip in str(tag).lower() for tag in item.get("tags") or () for skip in cls.SKIP_TAGS)
+
+    def _discover_models(self, provider: Provider) -> list:
+        """The provider's preferred models it still lists, then any other usable listed model (heaviest first),
+        with models not reported healthy moved to the end. Falls back to the preferred list if listing fails."""
         try:
-            resp = requests.get(self.MODELS_URL, headers={"Authorization": f"Bearer {self.api_key}"}, timeout=15)
+            resp = requests.get(f"{provider.base_url}/models",
+                                headers={"Authorization": f"Bearer {provider.api_key}"}, timeout=15)
             resp.raise_for_status()
-            listed = {m["id"] for m in resp.json()["data"] if m.get("active", True)}
-        except (requests.RequestException, KeyError, TypeError, ValueError) as e:
-            print(f"[GROQ] Model listing unavailable ({type(e).__name__}) — using the built-in pool")
-            return list(self.MODEL_POOL)
-        extra = sorted(m for m in listed - set(self.MODEL_POOL)
-                       if not any(marker in m.lower() for marker in self.NON_TEXT_MARKERS))
-        models = [m for m in self.MODEL_POOL if m in listed] + extra
-        print(f"[GROQ] Model pool: {', '.join(models)}")
-        return models or list(self.MODEL_POOL)
+            body   = resp.json()
+            listed = {str(item["id"]): item for item in (body.get("data") or body.get("models"))
+                      if self._usable(item, provider)}
+        except (requests.RequestException, AttributeError, KeyError, TypeError, ValueError) as e:
+            print(f"[LLM] {provider.name} model listing unavailable ({type(e).__name__}) — using its built-in pool")
+            return list(provider.pool)
+        extra  = sorted((m for m in listed if m not in provider.pool),
+                        key=lambda m: (-(listed[m].get("weight") or 0), m))
+        models = [m for m in provider.pool if m in listed] + extra
+        models = ([m for m in models if listed[m].get("health", "live") == "live"]
+                  + [m for m in models if listed[m].get("health", "live") != "live"])
+        print(f"[LLM] {provider.name} model pool: {', '.join(models)}")
+        return models or list(provider.pool)
 
     def _pace(self):
         """Rate-limit dispatch rounds (not the immediate in-round model failover)
-        so independent Groq calls in a run don't burst faster than ~2/sec."""
+        so independent AI calls in a run don't burst faster than ~2/sec."""
         elapsed = time.monotonic() - self._last_round_ts
         if elapsed < self.MIN_CALL_INTERVAL:
             time.sleep(self.MIN_CALL_INTERVAL - elapsed)
         self._last_round_ts = time.monotonic()
 
     def _ordered_models(self):
-        """Least-loaded first: fewest calls made this run, ties broken by fewer tokens used.
-        Excludes models already confirmed dead (e.g. 404 model_not_found) this run."""
-        live = [m for m in self.models if m not in self.dead]
-        return sorted(live, key=lambda m: (self.usage[m]["calls"], self.usage[m]["tokens"]))
+        """Best first, except that models which failed more often this run go behind those that failed less.
+        Excludes models confirmed unusable and providers that are blocked this run."""
+        live = [e for e in self.entries if e not in self.dead and e[0] not in self.blocked]
+        return sorted(live, key=lambda e: self.failures[e])  # stable sort keeps the best-first order within ties
 
     @staticmethod
     def _backoff_seconds(round_idx: int) -> float:
         return (2 ** (round_idx + 1)) + random.uniform(0, 0.5)
 
-    def complete(self, messages: list, max_tokens: int = 1024, temperature: Optional[float] = None,
-                 timeout: int = 30, label: str = "groq") -> Optional[str]:
-        """Run a chat completion against the pool, least-loaded model first.
+    def _post(self, entry: tuple, payload: dict, timeout: int):
+        provider = self.providers[entry[0]]
+        return requests.post(f"{provider.base_url}/chat/completions",
+                             headers={"Authorization": f"Bearer {provider.api_key}",
+                                      "Content-Type":  "application/json"},
+                             json={**payload, "model": entry[1]}, timeout=timeout)
 
-        Immediately rotates to the next model on 429/5xx. A model that comes
-        back 404 (model decommissioned/not found on this account) is
-        blacklisted for the rest of the run so it stops burning an attempt on
-        every subsequent call. If every *live* model fails in a round, backs
-        off (Retry-After-aware, else exponential + jitter) and tries one more
-        full round before giving up. A 413 (request above that model's
-        per-minute token limit) skips that model for this call only, since
-        larger models allow more; once every model has returned 413 the call
-        gives up so the caller can fall back to local logic.
+    @staticmethod
+    def _is_json(resp) -> bool:
+        try:
+            resp.json()
+            return True
+        except ValueError:
+            return False
+
+    def _provider_refused(self, resp) -> Optional[str]:
+        """Why the whole provider is unusable (bad key, or blocked before reaching the API), else None."""
+        if resp.status_code == 401:
+            return "rejected the API key"
+        if resp.status_code == 403 and not self._is_json(resp):
+            return "blocked the request before it reached the API (an HTML page, not an API error)"
+        return None
+
+    @staticmethod
+    def _content(resp) -> Optional[str]:
+        try:
+            content = resp.json()["choices"][0]["message"]["content"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            return None
+        return content if isinstance(content, str) and content.strip() else None
+
+    def complete(self, messages: list, max_tokens: int = 1024, temperature: Optional[float] = None,
+                 timeout: int = 30, label: str = "llm") -> Optional[str]:
+        """Run a chat completion against the pool, best model first.
+
+        Immediately moves to the next model on a network error, 429, 5xx or
+        unusable reply. A model that comes back 404, or 403 with an API error
+        (not on this account or plan), is dropped for the rest of the run. A
+        401, or a 403 HTML page (a firewall or IP block), drops that whole
+        provider for the run. If every live model fails in a round, backs off
+        (Retry-After-aware, else exponential + jitter) and tries again, up to
+        POOL_RETRY_ATTEMPTS more rounds. A 413 (request above that model's
+        token limit) skips that model for this call only; once every model has
+        returned 413 the call gives up so the caller can fall back to local logic.
         """
         last_err = None
         too_large = set()  # models that returned 413 for this payload
+        payload = {"max_tokens": max_tokens, "messages": messages}
+        if temperature is not None:
+            payload["temperature"] = temperature
+
         for round_idx in range(1 + self.POOL_RETRY_ATTEMPTS):
-            models = [m for m in self._ordered_models() if m not in too_large]
-            if not models:
-                print(f"[GROQ] ({label}) No model in the pool can take this request — giving up (last error: {last_err})")
+            entries = [e for e in self._ordered_models() if e not in too_large]
+            if not entries:
+                print(f"[LLM] ({label}) No model in the pool can take this request — giving up (last error: {last_err})")
                 return None
 
             self._pace()
             retry_after_seen = 0.0
 
-            for model in models:
-                payload = {"model": model, "max_tokens": max_tokens, "messages": messages}
-                if temperature is not None:
-                    payload["temperature"] = temperature
-
+            for entry in entries:
+                if entry[0] in self.blocked:  # blocked earlier in this round
+                    continue
+                tag = f"{entry[0]}:{entry[1]}"
                 try:
-                    print(f"[GROQ] ({label}) Calling model '{model}'...")
-                    resp = requests.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {self.api_key}",
-                            "Content-Type":  "application/json",
-                        },
-                        json=payload,
-                        timeout=timeout,
-                    )
+                    print(f"[LLM] ({label}) Calling '{tag}'...")
+                    resp = self._post(entry, payload, timeout)
                 except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                    print(f"[GROQ] ({label}) '{model}' network error ({e}) — trying next model")
-                    self.usage[model]["calls"] += 1
+                    print(f"[LLM] ({label}) '{tag}' network error ({e}) — trying next model")
+                    self.failures[entry] += 1
                     last_err = e
                     continue
 
-                if resp.status_code == 413:
-                    too_large.add(model)
-                    print(f"[GROQ] ({label}) '{model}' returned 413 (payload above its token limit) "
+                status  = resp.status_code
+                refused = self._provider_refused(resp)
+                if refused:
+                    self.blocked.add(entry[0])
+                    print(f"[LLM] ({label}) {entry[0]} {refused} (HTTP {status}) "
+                          f"— skipping {entry[0]} for the rest of this run")
+                    last_err = f"HTTP {status}"
+                    continue
+
+                if status == 413:
+                    too_large.add(entry)
+                    print(f"[LLM] ({label}) '{tag}' returned 413 (payload above its token limit) "
                           f"— trying the next model")
                     last_err = "HTTP 413"
                     continue
 
-                if resp.status_code == 404:
-                    self.usage[model]["calls"] += 1
-                    self.dead.add(model)
-                    print(f"[GROQ] ({label}) '{model}' returned 404 (not found on this account) "
-                          f"— blacklisting it for the rest of this run: {resp.text[:300]}")
-                    last_err = f"HTTP {resp.status_code}"
+                if status in (403, 404):
+                    self.dead.add(entry)
+                    print(f"[LLM] ({label}) '{tag}' returned {status} (not available to this account) "
+                          f"— dropping it for the rest of this run: {resp.text[:300]}")
+                    last_err = f"HTTP {status}"
                     continue
 
-                if resp.status_code == 429 or resp.status_code >= 500:
-                    self.usage[model]["calls"] += 1
+                if status == 429 or status >= 500:
+                    self.failures[entry] += 1
                     retry_after = resp.headers.get("Retry-After")
-                    print(f"[GROQ] ({label}) '{model}' returned HTTP {resp.status_code} "
+                    print(f"[LLM] ({label}) '{tag}' returned HTTP {status} "
                           f"— rotating to next model" + (f" (Retry-After: {retry_after}s)" if retry_after else ""))
                     if retry_after:
                         try:
                             retry_after_seen = max(retry_after_seen, float(retry_after))
                         except ValueError:
                             pass
-                    last_err = f"HTTP {resp.status_code}"
+                    last_err = f"HTTP {status}"
                     continue
 
-                if resp.status_code >= 400:
-                    self.usage[model]["calls"] += 1
-                    print(f"[GROQ] ({label}) '{model}' failed with HTTP {resp.status_code}: {resp.text[:300]}")
-                    last_err = f"HTTP {resp.status_code}"
+                if status >= 400:
+                    self.failures[entry] += 1
+                    print(f"[LLM] ({label}) '{tag}' failed with HTTP {status}: {resp.text[:300]}")
+                    last_err = f"HTTP {status}"
                     continue
 
-                try:
-                    body    = resp.json()
-                    content = body["choices"][0]["message"]["content"]
-                except Exception as e:
-                    self.usage[model]["calls"] += 1
-                    print(f"[GROQ] ({label}) '{model}' returned unparseable response ({e}) — trying next model")
-                    last_err = e
+                content = self._content(resp)
+                if content is None:
+                    self.failures[entry] += 1
+                    print(f"[LLM] ({label}) '{tag}' returned an empty or unparseable response — trying next model")
+                    last_err = "unparseable response"
                     continue
 
-                self.usage[model]["calls"]  += 1
-                self.usage[model]["tokens"] += body.get("usage", {}).get("total_tokens", 0)
-                print(f"[GROQ] ({label}) '{model}' succeeded")
+                print(f"[LLM] ({label}) '{tag}' succeeded")
                 return content
 
             # Every live model in the pool failed this round. Waiting cannot help a request too large for all of them.
-            if not [m for m in self._ordered_models() if m not in too_large]:
-                print(f"[GROQ] ({label}) Request too large for every model in the pool — giving up")
+            if not [e for e in self._ordered_models() if e not in too_large]:
+                print(f"[LLM] ({label}) No usable model left for this request — giving up (last error: {last_err})")
                 return None
             if round_idx < self.POOL_RETRY_ATTEMPTS:
                 wait = retry_after_seen if retry_after_seen > 0 else self._backoff_seconds(round_idx)
-                print(f"[GROQ] ({label}) Entire model pool exhausted this round "
+                print(f"[LLM] ({label}) Entire model pool exhausted this round "
                       f"— backing off {wait:.1f}s before retry round {round_idx + 2}")
                 time.sleep(wait)
 
-        print(f"[GROQ] ({label}) All models in pool exhausted after "
+        print(f"[LLM] ({label}) All models in pool exhausted after "
               f"{1 + self.POOL_RETRY_ATTEMPTS} round(s) — giving up (last error: {last_err})")
         return None
 
+    def check(self) -> bool:
+        """Send one tiny request to every model in the pool, without failover, and report which ones answer."""
+        answered = 0
+        for entry in self.entries:
+            tag = f"{entry[0]}:{entry[1]}"
+            if entry[0] in self.blocked:
+                print(f"[CHECK] {tag:<42} skipped — {entry[0]} is blocked")
+                continue
+            start = time.monotonic()
+            try:
+                resp = self._post(entry, {"max_tokens": 512, "temperature": 0, "messages": self.CHECK_PROMPT}, 45)
+            except requests.RequestException as e:
+                print(f"[CHECK] {tag:<42} network error ({type(e).__name__})")
+                continue
+            took    = f"{time.monotonic() - start:.1f}s"
+            content = self._content(resp) if resp.status_code < 400 else None
+            refused = self._provider_refused(resp)
+            if content:
+                answered += 1
+                print(f"[CHECK] {tag:<42} OK in {took}: {content.strip()[:40]!r}")
+            elif refused:
+                self.blocked.add(entry[0])
+                print(f"[CHECK] {tag:<42} HTTP {resp.status_code} in {took}: {entry[0]} {refused}")
+            else:
+                print(f"[CHECK] {tag:<42} HTTP {resp.status_code} in {took}: {resp.text[:200]!r}")
+        print(f"[CHECK] {answered}/{len(self.entries)} models answered")
+        return answered > 0
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-_groq_dispatcher: Optional[GroqDispatcher] = None
+
+LLM_PROVIDERS = [p for p in (
+    Provider("apinex", "https://api.apinex.bond/v1", os.environ.get("APINEX_API_KEY", ""), APINEX_POOL, "free/"),
+    Provider("groq", "https://api.groq.com/openai/v1", os.environ.get("GROQ_API_KEY", ""), GROQ_POOL),
+) if p.api_key]
+NO_LLM_KEY = "No AI provider key is set (APINEX_API_KEY or GROQ_API_KEY)"
+_llm_dispatcher: Optional[LLMDispatcher] = None
 
 
-def get_groq_dispatcher() -> Optional[GroqDispatcher]:
-    global _groq_dispatcher
-    if not GROQ_API_KEY:
+def get_llm_dispatcher() -> Optional[LLMDispatcher]:
+    global _llm_dispatcher
+    if not LLM_PROVIDERS:
         return None
-    if _groq_dispatcher is None:
-        _groq_dispatcher = GroqDispatcher(GROQ_API_KEY)
-    return _groq_dispatcher
+    if _llm_dispatcher is None:
+        _llm_dispatcher = LLMDispatcher(LLM_PROVIDERS)
+    return _llm_dispatcher
 
 
 # EMAIL AI UTILITIES
 
 # Same "4 chars ≈ 1 token" estimate and 4500-token ceiling ai_diff() uses to
-# route oversized blocks to local processing before ever calling Groq — an
+# route oversized blocks to local processing before ever calling a model — an
 # ADDED config's full systemInstruction can run to 10k+ estimated tokens,
 # which reliably 413s every model in the pool (so without this cap the
 # summary call fails outright instead of degrading).
@@ -699,10 +807,10 @@ def parse_llm_json(text: str):
 
 
 def generate_functional_summary(old_text: str, new_text: str) -> str:
-    """Uses Groq to generate a concise summary of how a prompt change transforms operational behavior."""
-    dispatcher = get_groq_dispatcher()
+    """Uses the AI model pool to generate a concise summary of how a prompt change transforms operational behavior."""
+    dispatcher = get_llm_dispatcher()
     if dispatcher is None:
-        return "GROQ_API_KEY environment secret is missing. Cannot evaluate prompt modifications."
+        return f"{NO_LLM_KEY}. Cannot evaluate prompt modifications."
 
     # Perform line-level comparison locally to optimize token payloads
     delta = delta_lines(old_text, new_text)
@@ -711,7 +819,7 @@ def generate_functional_summary(old_text: str, new_text: str) -> str:
 
     if len(delta) > SUMMARY_DELTA_CHAR_LIMIT:
         print(f"[SUMMARY] Delta too large ({len(delta)} chars) — truncated to "
-              f"{SUMMARY_DELTA_CHAR_LIMIT} chars (head+tail) before calling Groq")
+              f"{SUMMARY_DELTA_CHAR_LIMIT} chars (head+tail) before calling the model pool")
         delta = clip(delta, SUMMARY_DELTA_CHAR_LIMIT)
 
     messages = [
@@ -725,19 +833,19 @@ def generate_functional_summary(old_text: str, new_text: str) -> str:
         }
     ]
 
-    print("[SUMMARY] Dispatching isolated prompt delta to Groq model pool for change analysis...")
+    print("[SUMMARY] Dispatching isolated prompt delta to the AI model pool for change analysis...")
     content = dispatcher.complete(messages, max_tokens=300, temperature=0.2, label="summary")
     if content is None:
-        return "Unable to compile functional impact analysis — Groq model pool exhausted or unavailable."
+        return "Unable to compile functional impact analysis — AI model pool exhausted or unavailable."
 
     return content.strip()
 
 
 def ai_diff(old: str, new: str) -> tuple:
-    """Use Groq to semantically compare two texts by processing only changed blocks to save tokens."""
-    dispatcher = get_groq_dispatcher()
+    """Use the AI model pool to semantically compare two texts by processing only changed blocks to save tokens."""
+    dispatcher = get_llm_dispatcher()
     if dispatcher is None:
-        print("[DIFF] GROQ_API_KEY not set — falling back to character diff")
+        print(f"[DIFF] {NO_LLM_KEY} — falling back to character diff")
         return char_diff(old, new)
 
     # Split lines to track identical sections and isolate actual modifications
@@ -752,7 +860,7 @@ def ai_diff(old: str, new: str) -> tuple:
         old_chunk_text = "".join(old_lines[i1:i2])
         new_chunk_text = "".join(new_lines[j1:j2])
 
-        # Only real rewrites go to Groq; unchanged, added, removed and whitespace-only blocks are diffed locally
+        # Only real rewrites go to the model pool; unchanged, added, removed and whitespace-only blocks are diffed locally
         pair = None
         if op == "equal":
             pair = esc(old_chunk_text), esc(new_chunk_text)
@@ -762,7 +870,7 @@ def ai_diff(old: str, new: str) -> tuple:
             if estimated_tokens > MAX_BLOCK_TOKENS:
                 print(f"[DIFF] Modification block too large ({estimated_tokens} est. tokens). Running local fallback char_diff for safety.")
             else:
-                print(f"[DIFF] Dispatching semantic block diff to Groq model pool ({estimated_tokens} est. tokens)...")
+                print(f"[DIFF] Dispatching semantic block diff to the AI model pool ({estimated_tokens} est. tokens)...")
                 messages = [{"role": "system", "content": SEMANTIC_DIFF_PROMPT},
                             {"role": "user", "content": f"BEFORE:\n{old_chunk_text}\n\nAFTER:\n{new_chunk_text}"}]
                 content = dispatcher.complete(messages, max_tokens=4096, temperature=0.0, timeout=45, label="ai_diff")
@@ -771,9 +879,9 @@ def ai_diff(old: str, new: str) -> tuple:
                 after  = render_marked(parsed.get("after"), new_chunk_text, added=True)
                 if before is not None and after is not None and "<mark" in before + after:
                     pair = before, after
-                    print("[DIFF] Groq semantic block diff succeeded")
+                    print("[DIFF] AI semantic block diff succeeded")
                 else:
-                    print("[DIFF] Groq semantic diff unavailable or not faithful to the text — using fallback char_diff")
+                    print("[DIFF] AI semantic diff unavailable or not faithful to the text — using fallback char_diff")
 
         block_old_html, block_new_html = pair or char_diff(old_chunk_text, new_chunk_text)
         old_html_chunks.append(block_old_html)
@@ -1015,9 +1123,9 @@ F must be one of "allowed_fields". R is one short sentence. Long texts may be tr
 
 def draft_request(thread: dict, live_flat: dict, request: str) -> Optional[dict]:
     """Ask the model pool for a structured draft. None means the pool is unavailable (retry later)."""
-    dispatcher = get_groq_dispatcher()
+    dispatcher = get_llm_dispatcher()
     if dispatcher is None:
-        print("[DRAFT] GROQ_API_KEY not set — cannot draft")
+        print(f"[DRAFT] {NO_LLM_KEY} — cannot draft")
         return None
 
     def short(field, value):
@@ -1333,6 +1441,12 @@ def main():
     print(f"[START] VertexWatch [{ENV_TARGET.upper()}] — {now_ist()}")
     print(f"[START] Context: {run_context}")
     print(f"[START] Endpoint: {GET_ALL_URL}")
+
+    if LLM_CHECK:
+        dispatcher = get_llm_dispatcher()
+        if dispatcher is None:
+            print(f"[CHECK] {NO_LLM_KEY}")
+        sys.exit(0 if dispatcher and dispatcher.check() else 1)
 
     state   = load_json(STATE_FILE, {"lastPoll": 0, "threads": {}})
     loaded  = json.dumps(state, default=str)

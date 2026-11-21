@@ -14,7 +14,7 @@ Every config change is caught, explained, and fixable from a single email reply.
 
 <br/>
 
-| 5 | 15 min | 1 | 0 |
+| 4 | 15 min | 1 | 0 |
 |:---:|:---:|:---:|:---:|
 | environments watched | reply check interval | email per changed version | changes applied without a human |
 

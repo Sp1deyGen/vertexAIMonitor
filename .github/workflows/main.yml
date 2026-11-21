@@ -5,7 +5,7 @@ on:
   schedule:
     - cron: "*/15 * * * *"   # reply check every run; full poll once 3 hours have passed since the last attempt
 
-# One workflow run at a time; the 5 environment jobs inside a run execute in parallel.
+# One workflow run at a time; the 4 environment jobs inside a run execute in parallel.
 # A queued run replaced by a newer one loses nothing: the next run polls if a poll is due.
 concurrency:
   group: vertexwatch-monitors
@@ -23,7 +23,9 @@ jobs:
           - { env: sandbox,  slug: sandbox,  user: SANDBOX_USERNAME, pass: SANDBOX_PASSWORD }
           - { env: jkc-uat,  slug: jkc_uat,  user: JKC_USERNAME,     pass: JKC_UAT_PASSWORD }
           - { env: jkc-prod, slug: jkc_prod, user: JKC_USERNAME,     pass: JKC_PROD_PASSWORD }
-          - { env: prod,     slug: prod,     user: PROD_USERNAME,    pass: PROD_PASSWORD }
+          # prod is paused: its API is now IP-restricted and it no longer needs tracking.
+          # Uncomment to resume; monitor.py still knows the environment.
+          # - { env: prod,     slug: prod,     user: PROD_USERNAME,    pass: PROD_PASSWORD }
     # Two caches: the path list is part of a cache's version, so the snapshot cache keeps its original
     # two files (existing snapshots keep restoring) and the reply state has a cache of its own.
     env:
